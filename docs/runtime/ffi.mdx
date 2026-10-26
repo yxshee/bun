@@ -244,6 +244,17 @@ pointer as valid only until your next FFI call reuses that buffer (the usual C r
 that return their input). Clone it (via the returned string, or `new CString`) rather than holding
 the raw address.
 
+**Decoding.** `new CString`, a `cstring` return value, and a `cstring` parameter of a `JSCallback`
+all decode the C string as UTF-8. Each sequence of bytes that is not valid UTF-8 becomes U+FFFD (the
+replacement character), as with `TextDecoder`, and the valid text around it is kept. For a C string in
+another encoding, declare the return type as `ptr` and decode the bytes yourself:
+
+```ts
+// returns: "ptr"
+const address = symbols.get_legacy_name();
+const name = address && new TextDecoder("windows-1252").decode(toArrayBuffer(address));
+```
+
 ---
 
 ## Function pointers

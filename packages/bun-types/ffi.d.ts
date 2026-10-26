@@ -304,7 +304,8 @@ declare module "bun:ffi" {
 
     /**
      * When used as a `returns`, the value becomes a `string` (a NULL pointer
-     * becomes `null`).
+     * becomes `null`). The C string is decoded as UTF-8, the same as
+     * {@link CString}: each sequence that is not valid UTF-8 becomes U+FFFD.
      *
      * When used in `args`, it is equivalent to {@link FFIType.pointer} and
      * additionally accepts a JavaScript string.
@@ -1025,6 +1026,8 @@ declare module "bun:ffi" {
      * If `byteLength` is not provided, the string is assumed to be null-terminated.
      * The result is a clone of the C string, so it is safe to keep using it after
      * the memory at `ptr` has been freed. A falsy `ptr` yields an empty string.
+     * Each sequence of bytes that is not valid UTF-8 becomes U+FFFD (the
+     * replacement character), as with `TextDecoder`.
      *
      * Bun catches some invalid pointers, but not all. Passing an invalid
      * pointer, or reading past the end of the memory it points to, can crash

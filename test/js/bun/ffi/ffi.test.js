@@ -781,6 +781,181 @@ describe.skipIf(!FFI_FIXTURE_PATH)("engine-native cstring", () => {
     expect(typeof received).toBe("string");
     expect(echoes_cstring(received)).toBe("hello from js");
   });
+
+  // A `cstring` return and a JSCallback `cstring` parameter decode a C string the way `new CString(ptr)`
+  // does: UTF-8, with U+FFFD for each invalid sequence. One invalid byte used to make the engine read
+  // the whole string as Latin-1, so these gave a different string than `new CString` for the same bytes.
+  describe("a C string that is not valid UTF-8", () => {
+    const codePoints = string => Array.from(string, character => character.codePointAt(0).toString(16)).join(" ");
+    // The bytes of a C string, and the code points of the string it decodes to.
+    const vectors = [
+      ["68 c3 a9 21", "68 e9 21"], // valid: 2-byte sequence
+      ["e6 97 a5 e6 9c ac", "65e5 672c"], // valid: 3-byte sequences
+      ["f0 9f 98 80", "1f600"], // valid: 4-byte sequence
+      ["ef bb bf 61", "feff 61"], // valid: a BOM is kept
+      ["e9", "fffd"], // a Latin-1 byte alone
+      ["61 e9 62", "61 fffd 62"], // a Latin-1 byte between ASCII
+      ["68 65 6c 6c 6f ff", "68 65 6c 6c 6f fffd"], // ASCII, then a byte that is never valid
+      ["61 c3 a9 62 ff", "61 e9 62 fffd"], // the valid 2-byte sequence before the bad byte is kept
+      ["e6 97 a5 e6 9c ac e8", "65e5 672c fffd"], // a buffer cut off after a lead byte
+      ["c3", "fffd"], // a lead byte alone
+      ["f0 9f 98", "fffd"], // 3 of 4 bytes: one U+FFFD for the whole prefix
+      ["61 80 80 62", "61 fffd fffd 62"], // continuation bytes with no lead byte: one U+FFFD each
+      ["c0 80", "fffd fffd"], // overlong encoding of NUL
+      ["e0 80 61", "fffd fffd 61"], // overlong 3-byte encoding
+      ["ed a0 80", "fffd fffd fffd"], // a surrogate encoded as UTF-8
+      ["f4 90 80 80", "fffd fffd fffd fffd"], // above U+10FFFF
+      ["f8 88 80 80 80", "fffd fffd fffd fffd fffd"], // the 5-byte form
+    ].map(([hex, expected]) => {
+      const text = Uint8Array.from(hex.split(" "), byte => parseInt(byte, 16));
+      // The threadsafe callback reads the C string after the call that passed it returned. An explicit
+      // ArrayBuffer keeps one address; a small typed array moves its bytes when its buffer is first needed.
+      const bytes = new Uint8Array(new ArrayBuffer(text.length + 1));
+      bytes.set(text);
+      const string = String.fromCodePoint(...expected.split(" ").map(codePoint => parseInt(codePoint, 16)));
+      return { bytes, text, expected, string };
+    });
+    const echo = { echoes_cstring: { returns: "cstring", args: ["ptr"] } };
+
+    it("decodes to U+FFFD for each invalid sequence through every door", async () => {
+      const lib = dlopen(FFI_FIXTURE_PATH, echo);
+      const address = lib.symbols.echoes_cstring.ptr;
+      const linked = linkSymbols({ echoes_cstring: { ...echo.echoes_cstring, ptr: address } });
+      const cfunction = CFunction({ ...echo.echoes_cstring, ptr: address });
+
+      let received;
+      const callback = new JSCallback(string => void (received = string), { args: ["cstring"], returns: "void" });
+      const callCallback = CFunction({ ptr: callback.ptr, args: ["ptr"], returns: "void" });
+
+      // A threadsafe callback decodes its parameters when the queued call is delivered, after the caller
+      // returned.
+      const delivered = [];
+      let deliveries = 0;
+      const { promise: allDelivered, resolve } = Promise.withResolvers();
+      const threadsafeCallback = new JSCallback(
+        (string, index) => {
+          delivered[index] = string;
+          if (++deliveries === vectors.length) resolve();
+        },
+        { args: ["cstring", "i32"], returns: "void", threadsafe: true },
+      );
+      const callThreadsafeCallback = CFunction({ ptr: threadsafeCallback.ptr, args: ["ptr", "i32"], returns: "void" });
+
+      try {
+        const actual = vectors.map(({ bytes, text }, index) => {
+          received = undefined;
+          callCallback(bytes);
+          callThreadsafeCallback(bytes, index);
+          return {
+            dlopen: codePoints(lib.symbols.echoes_cstring(bytes)),
+            linkSymbols: codePoints(linked.symbols.echoes_cstring(bytes)),
+            CFunction: codePoints(cfunction(bytes)),
+            JSCallback: codePoints(received),
+            CString: codePoints(new CString(ptr(bytes))),
+            TextDecoder: codePoints(new TextDecoder("utf-8", { ignoreBOM: true }).decode(text)),
+          };
+        });
+        await allDelivered;
+        actual.forEach((doors, index) => (doors.threadsafeJSCallback = codePoints(delivered[index])));
+
+        expect(actual).toEqual(
+          vectors.map(({ expected }) => ({
+            dlopen: expected,
+            linkSymbols: expected,
+            CFunction: expected,
+            JSCallback: expected,
+            CString: expected,
+            TextDecoder: expected,
+            threadsafeJSCallback: expected,
+          })),
+        );
+      } finally {
+        callback.close();
+        threadsafeCallback.close();
+        linked.close();
+        lib.close();
+      }
+    });
+
+    it("decodes the same once the call site is optimized", () => {
+      const lib = dlopen(FFI_FIXTURE_PATH, echo);
+      const { echoes_cstring } = lib.symbols;
+      function decode(bytes) {
+        return echoes_cstring(bytes);
+      }
+      try {
+        // Enough calls for the DFG and the FTL to compile `decode`. Each tier boxes the returned pointer from
+        // its own code, so each has to give the same string as the first call. A debug build is slow enough
+        // per call that the compiler threads finish long before the smaller count runs out.
+        const wrong = new Set();
+        for (let i = 0, rounds = isDebug ? 8_000 : 40_000; i < rounds; i++) {
+          for (const { bytes, expected, string } of vectors) {
+            if (decode(bytes) !== string) wrong.add(expected);
+          }
+        }
+        expect([...wrong]).toEqual([]);
+      } finally {
+        lib.close();
+      }
+    });
+
+    it("agrees with new CString and TextDecoder on random bytes", () => {
+      const lib = dlopen(FFI_FIXTURE_PATH, echo);
+      const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+      // mulberry32: the same inputs on every run.
+      let seed = 0x9e3779b9;
+      const random = () => {
+        seed = (seed + 0x6d2b79f5) | 0;
+        let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+      const encoder = new TextEncoder();
+      const bytes = new Uint8Array(new ArrayBuffer(400));
+      try {
+        const differences = [];
+        for (let i = 0; i < 1500; i++) {
+          // Valid text of every sequence length, then damage: a random byte, a cut, or stray high bytes.
+          let length = 0;
+          const target = 1 + Math.floor(random() * 96);
+          while (length < target) {
+            const [low, high] = [
+              [0x20, 0x7e],
+              [0x80, 0x7ff],
+              [0x800, 0xd7ff],
+              [0x10000, 0x10ffff],
+            ][Math.floor(random() * 4)];
+            const { written } = encoder.encodeInto(
+              String.fromCodePoint(low + Math.floor(random() * (high - low + 1))),
+              bytes.subarray(length),
+            );
+            length += written;
+          }
+          const damage = Math.floor(random() * 4);
+          if (damage === 1) bytes[Math.floor(random() * length)] = 1 + Math.floor(random() * 255);
+          else if (damage === 2) length = 1 + Math.floor(random() * length);
+          else if (damage === 3) bytes[Math.floor(random() * length)] = 0x80 + Math.floor(random() * 128);
+          bytes[length] = 0;
+
+          const viaReturn = lib.symbols.echoes_cstring(bytes);
+          const viaCString = new CString(ptr(bytes));
+          const viaTextDecoder = decoder.decode(bytes.subarray(0, length));
+          if (viaReturn !== viaCString || viaReturn !== viaTextDecoder) {
+            differences.push({
+              bytes: bytes.subarray(0, length).toHex(),
+              return: codePoints(viaReturn),
+              CString: codePoints(viaCString),
+              TextDecoder: codePoints(viaTextDecoder),
+            });
+            if (differences.length === 3) break;
+          }
+        }
+        expect(differences).toEqual([]);
+      } finally {
+        lib.close();
+      }
+    });
+  });
 });
 
 describe("read edge cases", () => {
