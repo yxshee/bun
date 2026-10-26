@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { bunEnv, bunExe, isWindows, normalizeBunSnapshot, tempDir } from "harness";
-import { mkdirSync, symlinkSync } from "node:fs";
-import { join } from "node:path";
+import { bunEnv, bunExe, isDebug, isWindows, normalizeBunSnapshot, tempDir } from "harness";
+import { mkdirSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 // The resolver caches every directory it reads, including the ones it did not
 // find, for the life of the process and shares that cache between the runtime,
@@ -152,6 +152,11 @@ const files = {
         res("L1", () => require.resolve("other-pkg", opts));
         write(path.join("other", "node_modules", "other-pkg", "index.js"), "");
         res("L2", () => require.resolve("other-pkg", opts));
+        // The same when the "paths" root itself does not exist at the first call.
+        const late = { paths: [path.resolve("late-root")] };
+        res("L3", () => require.resolve("late-pkg", late));
+        write(path.join("late-root", "node_modules", "late-pkg", "index.js"), "");
+        res("L4", () => require.resolve("late-pkg", late));
 
         // What stays missing keeps failing, and what resolved keeps resolving.
         res("M1", () => require.resolve("never-installed"));
@@ -167,6 +172,20 @@ const files = {
         res("N1", () => require.resolve("linked-pkg"));
         fs.symlinkSync(path.resolve("vendor", "linked-pkg"), nm("linked-pkg"));
         res("N2", () => require.resolve("linked-pkg"));
+        // A link whose target does not exist yet. Its directory is read for the
+        // first time with the link in it, so the listing has the name all along.
+        fs.mkdirSync(path.join("links", "node_modules"), { recursive: true });
+        fs.symlinkSync(path.join("..", "late-target", "lib.cjs"), path.join("links", "late-link.cjs"));
+        fs.symlinkSync(path.join("..", "..", "late-target", "pkg"), path.join("links", "node_modules", "late-linked"));
+        const links = requireFrom("links");
+        res("N3", () => links.resolve("./late-link.cjs"));
+        res("N4", () => links.resolve("./late-link"));
+        res("N5", () => links.resolve("late-linked"));
+        write(path.join("late-target", "lib.cjs"), "");
+        write(path.join("late-target", "pkg", "index.js"), "");
+        res("N6", () => links.resolve("./late-link.cjs"));
+        res("N7", () => links.resolve("./late-link"));
+        res("N8", () => links.resolve("late-linked"));
       },
 
       async nodepath() {
@@ -311,9 +330,123 @@ const files = {
         res("X1", () => m5.resolve("#alias"));
         write(path.join("m5", "inner", "package.json"), JSON.stringify({ name: "inner", imports: { "#alias": "./impl.cjs" } }));
         res("X2", () => m5.resolve("#alias"));
+        // A package that imports itself by name, once its package.json has that name
+        // and an "exports" map.
+        write(path.join("m6", "package.json"), JSON.stringify({ name: "not-yet" }));
+        write(path.join("m6", "feature.cjs"), "");
+        fs.mkdirSync(path.join("m6", "src"));
+        const m6 = requireFrom(path.join("m6", "src"));
+        res("SR1", () => m6.resolve("m6/feature"));
+        write(path.join("m6", "package.json"), JSON.stringify({ name: "m6", exports: { "./feature": "./feature.cjs" } }));
+        res("SR2", () => m6.resolve("m6/feature"));
+        // A "main" that names a file that is not there, then one that is.
+        write(nm("m7", "package.json"), JSON.stringify({ name: "m7", main: "./missing.cjs" }));
+        write(nm("m7", "real.cjs"), "");
+        res("MN1", () => require.resolve("m7"));
+        write(nm("m7", "package.json"), JSON.stringify({ name: "m7", main: "./real.cjs" }));
+        res("MN2", () => require.resolve("m7"));
         // A map that did not change keeps failing.
         res("W1", () => m1.resolve("#other"));
         res("W2", () => require.resolve("m3/hidden"));
+      },
+
+      async kind() {
+        // The kind of an entry is cached from its first stat(). Here a name changes
+        // its kind after its directory was read.
+        const kinds = requireFrom("kinds");
+        // A directory with the name of a file, then that file.
+        fs.mkdirSync(path.join("kinds", "a.cjs"), { recursive: true });
+        res("KD1", () => kinds.resolve("./a.cjs"));
+        fs.rmdirSync(path.join("kinds", "a.cjs"));
+        write(path.join("kinds", "a.cjs"), "");
+        res("KD2", () => kinds.resolve("./a.cjs"));
+        // A file where a directory is looked up, then that directory.
+        write(path.join("kinds", "b"), "");
+        res("KD3", () => kinds.resolve("./b/index.cjs"));
+        fs.rmSync(path.join("kinds", "b"));
+        write(path.join("kinds", "b", "index.cjs"), "");
+        res("KD4", () => kinds.resolve("./b/index.cjs"));
+      },
+
+      async config() {
+        // A tsconfig.json is read with its directory, not by the lookup that
+        // misses. A miss reads again the one that the importer's lookups go
+        // through, each file it extends, and each level below it, which has none.
+        const aliased = (name, target) =>
+          JSON.stringify({ compilerOptions: { baseUrl: ".", paths: { [name]: [target] } } });
+        const project = name => {
+          write(path.join(name, "src", "lib", "utils.cjs"), "");
+          return requireFrom(path.join(name, "src"));
+        };
+        // Created in the importing directory.
+        const c1 = project("c1");
+        res("Y1", () => c1.resolve("c1-utils"));
+        write(path.join("c1", "src", "tsconfig.json"), aliased("c1-utils", "./lib/utils.cjs"));
+        res("Y2", () => c1.resolve("c1-utils"));
+        // Created above the importing directory.
+        const c2 = project("c2");
+        res("Y3", () => c2.resolve("c2-utils"));
+        write(path.join("c2", "tsconfig.json"), aliased("c2-utils", "./src/lib/utils.cjs"));
+        res("Y4", () => c2.resolve("c2-utils"));
+        // An alias added to the one that is there.
+        write(path.join("c3", "src", "tsconfig.json"), JSON.stringify({ compilerOptions: { baseUrl: "." } }));
+        const c3 = project("c3");
+        res("Y5", () => c3.resolve("c3-utils"));
+        write(path.join("c3", "src", "tsconfig.json"), aliased("c3-utils", "./lib/utils.cjs"));
+        res("Y6", () => c3.resolve("c3-utils"));
+        // An alias added to the file that it extends.
+        write(path.join("c4", "base.json"), JSON.stringify({ compilerOptions: { baseUrl: "." } }));
+        write(path.join("c4", "src", "tsconfig.json"), JSON.stringify({ extends: "../base.json" }));
+        const c4 = project("c4");
+        res("Y7", () => c4.resolve("c4-utils"));
+        write(path.join("c4", "base.json"), aliased("c4-utils", "./src/lib/utils.cjs"));
+        res("Y8", () => c4.resolve("c4-utils"));
+        // A jsconfig.json.
+        const c5 = project("c5");
+        res("Y9", () => c5.resolve("c5-utils"));
+        write(path.join("c5", "src", "jsconfig.json"), aliased("c5-utils", "./lib/utils.cjs"));
+        res("Y10", () => c5.resolve("c5-utils"));
+        // One that was read while half written.
+        write(path.join("c6", "src", "tsconfig.json"), '{ "compilerOptions": ');
+        const c6 = project("c6");
+        res("Y11", () => c6.resolve("c6-utils"));
+        write(path.join("c6", "src", "tsconfig.json"), aliased("c6-utils", "./lib/utils.cjs"));
+        res("Y12", () => c6.resolve("c6-utils"));
+        // Bun.build() reads the same cache.
+        write(path.join("c7", "src", "lib", "utils.ts"), "export const v = 42;");
+        write(path.join("c7", "src", "ent.ts"), 'import { v } from "c7-utils"; console.log(v);');
+        await build("Y13", path.join("c7", "src", "ent.ts"));
+        write(path.join("c7", "tsconfig.json"), aliased("c7-utils", "./src/lib/utils.ts"));
+        await build("Y14", path.join("c7", "src", "ent.ts"));
+        // One that did not change keeps failing.
+        res("Y15", () => c1.resolve("c1-other"));
+        res("Y16", () => c3.resolve("c3-other"));
+      },
+
+      async steady() {
+        // The test wrote these files before this process started, and nothing
+        // changes on disk here. So no miss may drop a directory: a directory that
+        // is dropped is read again, and its package.json parsed again, into memory
+        // that is never freed. The test counts the evictions in the debug log.
+        const s3 = requireFrom(path.join("s3", "src"));
+        const s4 = requireFrom(path.join("s4", "src"));
+        const s5 = requireFrom(path.join("s5", "src"));
+        for (let i = 0; i < 3; i++) {
+          // A package.json with a byte order mark, which the loader strips.
+          res("Z1", () => require.resolve("s1/hidden"));
+          // The same in UTF-16.
+          res("Z2", () => require.resolve("s2/hidden"));
+          // A package.json that does not parse, above the importer.
+          res("Z3", () => s3.resolve("#x"));
+          // A tsconfig.json that does not parse.
+          res("Z4", () => s4.resolve("s4-utils"));
+          // A tsconfig.json with a byte order mark, that extends a file that is not there.
+          res("Z5", () => s5.resolve("s5-utils"));
+          // A path below a file.
+          res("Z6", () => require.resolve("./s6.cjs/sub"));
+          // A link whose target is not there.
+          res("Z7", () => require.resolve("./s7.cjs"));
+        }
       },
 
       async build() {
@@ -393,6 +526,8 @@ describe.concurrent("a failed resolution sees files and packages created after t
       K2 OK lib/index.js
       L1 ERR MODULE_NOT_FOUND
       L2 OK other/node_modules/other-pkg/index.js
+      L3 ERR MODULE_NOT_FOUND
+      L4 OK late-root/node_modules/late-pkg/index.js
       M1 ERR MODULE_NOT_FOUND
       M2 ERR MODULE_NOT_FOUND
       M3 ERR MODULE_NOT_FOUND
@@ -403,18 +538,27 @@ describe.concurrent("a failed resolution sees files and packages created after t
     `);
   });
 
-  test.skipIf(isWindows)("a package symlinked in after the miss", async () => {
-    expect(await runGroup("symlink")).toMatchInlineSnapshot(`
+  test.skipIf(isWindows)(
+    "a package symlinked in after the miss, and a link whose target is written later",
+    async () => {
+      expect(await runGroup("symlink")).toMatchInlineSnapshot(`
       {
         "exitCode": 0,
         "stderr": "",
         "stdout": 
       "N1 ERR MODULE_NOT_FOUND
-      N2 OK vendor/linked-pkg/index.js"
+      N2 OK vendor/linked-pkg/index.js
+      N3 ERR MODULE_NOT_FOUND
+      N4 ERR MODULE_NOT_FOUND
+      N5 ERR MODULE_NOT_FOUND
+      N6 OK late-target/lib.cjs
+      N7 OK late-target/lib.cjs
+      N8 OK late-target/pkg/index.js"
       ,
       }
     `);
-  });
+    },
+  );
 
   test("tsconfig paths aliases onto directories that gain files later", async () => {
     expect(await runGroup("tsconfig")).toMatchInlineSnapshot(`
@@ -528,11 +672,141 @@ describe.concurrent("a failed resolution sees files and packages created after t
       V2 OK m4/sub.cjs
       X1 ERR MODULE_NOT_FOUND
       X2 OK m5/inner/impl.cjs
+      SR1 ERR MODULE_NOT_FOUND
+      SR2 OK m6/feature.cjs
+      MN1 ERR MODULE_NOT_FOUND
+      MN2 OK node_modules/m7/real.cjs
       W1 ERR MODULE_NOT_FOUND
       W2 ERR MODULE_NOT_FOUND"
       ,
       }
     `);
+  });
+
+  test("a name that changes its kind after the miss", async () => {
+    expect(await runGroup("kind")).toMatchInlineSnapshot(`
+      {
+        "exitCode": 0,
+        "stderr": "",
+        "stdout": 
+      "KD1 ERR MODULE_NOT_FOUND
+      KD2 OK kinds/a.cjs
+      KD3 ERR MODULE_NOT_FOUND
+      KD4 OK kinds/b/index.cjs"
+      ,
+      }
+    `);
+  });
+
+  test("a tsconfig.json created or changed after the miss", async () => {
+    expect(await runGroup("config")).toMatchInlineSnapshot(`
+      {
+        "exitCode": 0,
+        "stderr": "",
+        "stdout": 
+      "Y1 ERR MODULE_NOT_FOUND
+      Y2 OK c1/src/lib/utils.cjs
+      Y3 ERR MODULE_NOT_FOUND
+      Y4 OK c2/src/lib/utils.cjs
+      Y5 ERR MODULE_NOT_FOUND
+      Y6 OK c3/src/lib/utils.cjs
+      Y7 ERR MODULE_NOT_FOUND
+      Y8 OK c4/src/lib/utils.cjs
+      Y9 ERR MODULE_NOT_FOUND
+      Y10 OK c5/src/lib/utils.cjs
+      Y11 ERR MODULE_NOT_FOUND
+      Y12 OK c6/src/lib/utils.cjs
+      Y13 ERR Could not resolve: "c7-utils". Maybe you need to "bun install"?
+      Y14 OK 1
+      Y15 ERR MODULE_NOT_FOUND
+      Y16 ERR MODULE_NOT_FOUND"
+      ,
+      }
+    `);
+  });
+
+  // The log of evictions exists in debug builds only, which is where this runs.
+  test.skipIf(!isDebug)("a miss drops no directory when nothing changed on disk", async () => {
+    const steadyFiles = (dir: string) => {
+      const write = (file: string, contents: string | Buffer) => {
+        mkdirSync(dirname(join(dir, file)), { recursive: true });
+        writeFileSync(join(dir, file), contents);
+      };
+      const manifest = (name: string) => "\uFEFF" + JSON.stringify({ name, exports: { ".": "./i.cjs" } });
+      write("node_modules/s1/package.json", manifest("s1"));
+      write("node_modules/s1/i.cjs", "");
+      write("node_modules/s2/package.json", Buffer.from(manifest("s2"), "utf16le"));
+      write("node_modules/s2/i.cjs", "");
+      write("s3/package.json", `{ "name": "s3", `);
+      mkdirSync(join(dir, "s3", "src"));
+      write("s4/src/tsconfig.json", `{ "compilerOptions": `);
+      const paths = { "s5-utils": ["./nowhere.cjs"] };
+      write(
+        "s5/src/tsconfig.json",
+        "\uFEFF" + JSON.stringify({ extends: "./nowhere.json", compilerOptions: { baseUrl: ".", paths } }),
+      );
+      write("s6.cjs", "");
+      // Not every Windows user may create a link. Without it the lookup misses all the same.
+      try {
+        symlinkSync("nowhere.cjs", join(dir, "s7.cjs"));
+      } catch {}
+    };
+    const { stdout, stderr, exitCode } = await runGroup("steady", () => ({ BUN_DEBUG_Resolver: "1" }), steadyFiles);
+    const lines = (stdout + "\n" + stderr).split("\n");
+    expect(lines.filter(line => /^Z\d /.test(line))).toEqual(
+      Array.from({ length: 3 }, () => [1, 2, 3, 4, 5, 6, 7].map(n => `Z${n} ERR MODULE_NOT_FOUND`)).flat(),
+    );
+    expect(lines.filter(line => /\[resolver\] Bust .* = true/.test(line))).toEqual([]);
+    expect(exitCode).toBe(0);
+  });
+
+  // A watcher drops the directory that changed. The directories below it still point at
+  // the entry that was dropped, so a lookup that walks up from them reads the old package.json.
+  // Windows is left out: its watcher can start to listen after the first run has printed.
+  test.skipIf(isWindows)("bun --hot: an imports entry added to a package.json above the importer", async () => {
+    using dir = tempDir("dir-cache-retry-hot", {
+      "node_modules/.keep": "",
+      "package.json": JSON.stringify({ name: "hot-alias" }),
+      "impl.cjs": `module.exports = "impl";`,
+      "src/x.cjs": `
+        let found;
+        try {
+          found = "OK " + require("#alias");
+        } catch (e) {
+          found = "ERR " + e.code;
+        }
+        module.exports = found;
+      `,
+      "server.js": `console.log("run 1: " + require("./src/x.cjs"));`,
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "--hot", "server.js"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "inherit",
+    });
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    let output = "";
+    const line = async (pattern: RegExp) => {
+      for (;;) {
+        const found = output.match(pattern);
+        if (found) return found[0];
+        const { value, done } = await reader.read();
+        if (done) throw new Error(`bun --hot exited before ${pattern}. Output:\n${output}`);
+        output += decoder.decode(value, { stream: true });
+      }
+    };
+    expect(await line(/run 1: .*/)).toBe("run 1: ERR MODULE_NOT_FOUND");
+
+    // A rename, so that the watcher sees a change of the directory.
+    const manifest = join(String(dir), "package.json");
+    writeFileSync(manifest + ".tmp", JSON.stringify({ name: "hot-alias", imports: { "#alias": "./impl.cjs" } }));
+    renameSync(manifest + ".tmp", manifest);
+    writeFileSync(join(String(dir), "server.js"), `console.log("run 2: " + require("./src/x.cjs"));`);
+    expect(await line(/run 2: .*/)).toBe("run 2: OK impl");
   });
 
   test("Bun.build() after the package was installed", async () => {

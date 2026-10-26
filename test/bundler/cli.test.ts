@@ -1101,21 +1101,24 @@ describe.concurrent("modules that fail to print", () => {
 describe.concurrent("bun build --watch", () => {
   // Resolves once `needle` has been written to `stream`. The stream only ends
   // early if the process dies, in which case the output so far (the crash
-  // report) is the error message.
-  async function outputUntil(stream: ReadableStream<Uint8Array>, needle: string): Promise<string> {
+  // report) is the error message. `seen.output` is what was read until now.
+  async function outputUntil(
+    stream: ReadableStream<Uint8Array>,
+    needle: string,
+    seen = { output: "" },
+  ): Promise<string> {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
-    let output = "";
     try {
-      while (!output.includes(needle)) {
+      while (!seen.output.includes(needle)) {
         const { value, done } = await reader.read();
-        if (done) throw new Error(`stream ended before ${JSON.stringify(needle)} appeared. Output:\n${output}`);
-        output += decoder.decode(value, { stream: true });
+        if (done) throw new Error(`stream ended before ${JSON.stringify(needle)} appeared. Output:\n${seen.output}`);
+        seen.output += decoder.decode(value, { stream: true });
       }
     } finally {
       reader.releaseLock();
     }
-    return output;
+    return seen.output;
   }
 
   // In watch mode every failed resolution busts the resolver's directory
@@ -1147,16 +1150,19 @@ describe.concurrent("bun build --watch", () => {
 
     // The failed build left the watcher running: fixing the entry point rebuilds.
     // On Windows the watcher thread can start to listen after the error is printed,
-    // and then it misses the fix. Write it again, each time after a longer wait: a
-    // build in progress starts again on every write.
-    const rebuilt = outputUntil(proc.stdout, "index.js");
+    // and then it misses the fix. Nothing in the output tells when it listens, so
+    // the fix is written again, four times at most, each time after a longer wait:
+    // a build in progress starts again on every write.
+    const seen = { output: "" };
+    const rebuilt = outputUntil(proc.stdout, "index.js", seen);
     let settled = false;
     const settle = () => void (settled = true);
     rebuilt.then(settle, settle);
-    for (let wait = 2000; !settled; wait *= 2) {
+    for (let wait = 2000; !settled && wait <= 16000; wait *= 2) {
       writeFileSync(entry, `console.log("fixed");\n`);
       await Promise.race([rebuilt.catch(settle), Bun.sleep(wait)]);
     }
+    if (!settled) throw new Error(`no rebuild after the fix was written four times. stdout:\n${seen.output}`);
     expect(await rebuilt).toContain("Bundled 1 module");
     expect(await Bun.file(join(String(dir), "dist", "index.js")).text()).toContain("fixed");
   });
