@@ -254,7 +254,7 @@ use crate::fs as Fs;
 use crate::fs::FilenameStoreAppender;
 use crate::node_fallbacks as NodeFallbackModules;
 use crate::package_json::{BrowserMap, ESModule, PackageJSON};
-use crate::tsconfig_json::TSConfigJSON;
+use crate::tsconfig_json::{ConfigSource, TSConfigJSON};
 
 pub use crate::data_url::DataURL;
 pub use crate::dir_info as DirInfo;
@@ -299,6 +299,46 @@ fn intern_package_json(pkg: PackageJSON) -> core::ptr::NonNull<PackageJSON> {
     // `Box<PackageJSON>` heap address is stable across `Vec` reallocation.
     // Derive from `&mut **last` so the returned pointer carries mut-provenance.
     core::ptr::NonNull::from(&mut **guard.last_mut().unwrap())
+}
+
+/// `package.json` and `tsconfig.json` files that were read and gave no configuration: a hash of
+/// each path, with a hash of the bytes that did not parse. `DirInfo` keeps nothing for such a
+/// file, so this is how a lookup that misses tells one that is still broken from one that changed.
+static UNPARSED_CONFIGS: std::sync::LazyLock<bun_threading::Guarded<Vec<(u64, u64)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn note_unparsed_config(path: &[u8], contents_hash: u64) {
+    let key = bun_wyhash::hash(path);
+    let mut unparsed = UNPARSED_CONFIGS.lock();
+    match unparsed.iter_mut().find(|entry| entry.0 == key) {
+        Some(entry) => entry.1 = contents_hash,
+        None => unparsed.push((key, contents_hash)),
+    }
+}
+
+fn is_unparsed_config(path: &[u8], contents_hash: u64) -> bool {
+    UNPARSED_CONFIGS
+        .lock()
+        .contains(&(bun_wyhash::hash(path), contents_hash))
+}
+
+/// What is at the path of a configuration file now.
+enum ConfigFileNow {
+    /// No file: nothing there, or something that is not a regular file.
+    Absent,
+    /// A file that cannot be read.
+    Unreadable,
+    /// A hash of its bytes as the loader reads them.
+    Hash(u64),
+}
+
+impl ConfigFileNow {
+    fn hash(&self) -> Option<u64> {
+        match self {
+            ConfigFileNow::Hash(hash) => Some(*hash),
+            ConfigFileNow::Absent | ConfigFileNow::Unreadable => None,
+        }
+    }
 }
 
 // `bun_core::declare_scope!` emits the per-scope `static ScopedLogger`; the
@@ -570,12 +610,11 @@ pub struct Resolver<'a> {
     pub custom_dir_paths: Option<&'a [bun_core::String]>,
 }
 
-/// What the resolution in progress on this thread did not find; see
-/// `Resolver::bust_touched_dirs`. Thread-local, not a `Resolver` field: the
-/// runtime copies its `Transpiler` bytewise into every transpiler job.
+/// What a lookup that missed read from the caches. `Resolver::bust_touched_dirs` checks each
+/// record on disk. A lookup collects records only when it is run again after a miss (the
+/// replay), so a lookup that succeeds pays one load of `ARMED_REPLAYS` where a record is made.
 #[derive(Default)]
 struct TouchedDirs {
-    recording: bool,
     records: Vec<TouchedDir>,
     /// Path bytes the records index into.
     bytes: Vec<u8>,
@@ -585,8 +624,13 @@ struct TouchedDirs {
 enum TouchedKind {
     /// The directory did not exist (a NOT_FOUND sentinel or a failed open).
     MissingDir,
-    /// The directory exists and its cached listing has no entry `name`.
+    /// The directory exists and its cached listing has no entry `name`, or has it as a link
+    /// whose target did not exist.
     MissingEntry,
+    /// The cached listing has `name` as a file.
+    FileEntry,
+    /// The cached listing has `name` as a directory.
+    DirEntry,
     /// A `node_modules` search level whose cached listing has no `node_modules`.
     NoNodeModules,
     /// A searched level, or a `node_modules` directory. Dropped with a
@@ -594,8 +638,11 @@ enum TouchedKind {
     SearchLevel,
     /// A lookup went through this directory's `package.json`, or found none here
     /// on the way to one: its `imports` or `exports` map had no match. Dropped
-    /// when the file no longer has the bytes that were parsed, or exists now.
+    /// when the file no longer has the bytes that were parsed, or is one that parses now.
     PackageJson,
+    /// A lookup read the `tsconfig.json` that applies in this directory: its own, or that of
+    /// the nearest level above that has one.
+    TsConfig,
 }
 
 #[derive(Clone, Copy)]
@@ -628,30 +675,111 @@ impl TouchedDirs {
     }
 }
 
+/// How many replays collect now, on all threads. It is zero except right after a miss.
+static ARMED_REPLAYS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 thread_local! {
-    static TOUCHED_DIRS: core::cell::RefCell<Option<Box<TouchedDirs>>> =
-        const { core::cell::RefCell::new(None) };
+    /// The list that the replay on this thread collects into. Null outside a replay. Not a
+    /// `Resolver` field: the runtime copies its `Transpiler` bytewise into every transpiler job.
+    static REPLAY: core::cell::Cell<*mut TouchedDirs> =
+        const { core::cell::Cell::new(core::ptr::null_mut()) };
 }
 
-/// The cached listing of `dir` has no entry `name`; called from `DirEntry::get`.
+thread_local! {
+    /// Not zero while a caller runs a sequence of lookups that fall back one to the next
+    /// (`Resolver::with_deferred_miss_check`): a miss inside the sequence is not checked. Read
+    /// only after a miss.
+    static DEFERRED_MISS_CHECKS: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// Counts one sequence in `DEFERRED_MISS_CHECKS` for as long as it lives.
+struct DeferredMissCheck;
+
+impl DeferredMissCheck {
+    fn enter() -> DeferredMissCheck {
+        DEFERRED_MISS_CHECKS.set(DEFERRED_MISS_CHECKS.get() + 1);
+        DeferredMissCheck
+    }
+}
+
+impl Drop for DeferredMissCheck {
+    fn drop(&mut self) {
+        DEFERRED_MISS_CHECKS.set(DEFERRED_MISS_CHECKS.get() - 1);
+    }
+}
+
+/// Sets `REPLAY` for as long as it lives.
+struct ReplayGuard;
+
+impl ReplayGuard {
+    fn arm(list: &mut TouchedDirs) -> ReplayGuard {
+        REPLAY.set(core::ptr::from_mut(list));
+        ARMED_REPLAYS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        ReplayGuard
+    }
+}
+
+impl Drop for ReplayGuard {
+    fn drop(&mut self) {
+        ARMED_REPLAYS.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        REPLAY.set(core::ptr::null_mut());
+    }
+}
+
+/// Whether some thread replays a lookup. The cheap test in front of each record.
+#[inline(always)]
+pub(crate) fn replay_armed() -> bool {
+    ARMED_REPLAYS.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// Whether this thread replays a lookup. A replay reads the caches and changes nothing.
+#[inline]
+fn replaying() -> bool {
+    replay_armed() && !REPLAY.get().is_null()
+}
+
+/// The cached listing of `dir` has no entry `name`. Called from `DirEntry::get`.
 #[inline]
 pub(crate) fn record_missing_entry(dir: &[u8], name: &[u8]) {
-    record_touched(TouchedKind::MissingEntry, dir, name);
+    if replay_armed() {
+        record_touched(TouchedKind::MissingEntry, dir, name);
+    }
 }
 
-#[inline]
+/// A lookup read the kind of the entry `name` of `dir`, which is cached from the first
+/// `stat()`. Called from `Entry::kind`, behind `replay_armed()`.
+#[cold]
+#[inline(never)]
+pub(crate) fn record_entry_kind(dir: &[u8], name: &[u8], kind: Fs::file_system::EntryKind) {
+    use Fs::file_system::EntryKind;
+    record_touched(
+        match kind {
+            EntryKind::File => TouchedKind::FileEntry,
+            EntryKind::Dir => TouchedKind::DirEntry,
+            // A link with no target is no entry to a lookup, until the target exists.
+            EntryKind::Dangling => TouchedKind::MissingEntry,
+        },
+        dir,
+        name,
+    );
+}
+
+#[cold]
+#[inline(never)]
 fn record_touched(kind: TouchedKind, dir: &[u8], name: &[u8]) {
-    TOUCHED_DIRS.with(|slot| {
-        if let Some(touched) = slot.borrow_mut().as_deref_mut() {
-            if touched.recording {
-                touched.push(
-                    kind,
-                    strings::without_trailing_slash_windows_path(dir),
-                    name,
-                );
-            }
-        }
-    });
+    let list = REPLAY.get();
+    if list.is_null() {
+        // The replay is on another thread.
+        return;
+    }
+    // SAFETY: `ReplayGuard::arm` pointed it at a list on the stack of
+    // `Resolver::recheck_after_miss` on this thread and clears it before that frame returns.
+    // Nothing else reads or writes the list during the replay.
+    unsafe { &mut *list }.push(
+        kind,
+        strings::without_trailing_slash_windows_path(dir),
+        name,
+    );
 }
 
 /// RAII guard returned by [`Resolver::scoped_log`]. Restores the previous
@@ -1499,43 +1627,45 @@ impl<'a> Resolver<'a> {
             return ResultUnion::NotFound;
         }
 
-        let mut tmp = self.resolve_without_symlinks_retrying(
-            source_dir_normalized,
-            import_path,
-            kind,
-            global_cache,
-        );
-
-        // Fragments in URLs in CSS imports are technically expected to work
-        if matches!(tmp, ResultUnion::NotFound) && kind.is_from_css() {
-            'try_without_suffix: {
-                // If resolution failed, try again with the URL query and/or hash removed
-                let maybe_suffix = strings::index_of_any(import_path, b"?#");
-                let Some(suffix) = maybe_suffix else {
-                    break 'try_without_suffix;
-                };
-                if suffix < 1 {
-                    break 'try_without_suffix;
+        // Fragments in URLs in CSS imports are technically expected to work: if resolution
+        // fails, try again with the URL query and/or hash removed. The lookup of the path as
+        // written is expected to miss then, so the two lookups share one check.
+        let css_suffix = if kind.is_from_css() {
+            strings::index_of_any(import_path, b"?#").filter(|&suffix| suffix >= 1)
+        } else {
+            None
+        };
+        let tmp = match css_suffix {
+            Some(suffix) => self.resolve_sequence_retrying(|this| {
+                let as_written = this.resolve_without_symlinks(
+                    source_dir_normalized,
+                    import_path,
+                    kind,
+                    global_cache,
+                );
+                if !matches!(as_written, ResultUnion::NotFound) {
+                    return as_written;
                 }
-
-                if let Some(debug) = self.debug_logs.as_mut() {
+                if let Some(debug) = this.debug_logs.as_mut() {
                     debug.add_note_fmt(format_args!(
                         "Retrying resolution after removing the suffix {}",
                         bstr::BStr::new(&import_path[suffix..])
                     ));
                 }
-                let result2 = self.resolve_without_symlinks_retrying(
+                this.resolve_without_symlinks(
                     source_dir_normalized,
                     &import_path[0..suffix],
                     kind,
                     global_cache,
-                );
-                if matches!(result2, ResultUnion::NotFound) {
-                    break 'try_without_suffix;
-                }
-                tmp = result2;
-            }
-        }
+                )
+            }),
+            None => self.resolve_without_symlinks_retrying(
+                source_dir_normalized,
+                import_path,
+                kind,
+                global_cache,
+            ),
+        };
 
         let ret = match tmp {
             ResultUnion::Success(mut result) => {
@@ -1832,8 +1962,8 @@ impl<'a> Resolver<'a> {
         Ok(())
     }
 
-    /// `resolve_without_symlinks`, then once more after a miss whose cached
-    /// negatives no longer match the disk. Nothing else invalidates a cached miss.
+    /// `resolve_without_symlinks`, then once more after a miss that read cached facts which
+    /// no longer match the disk. Nothing else invalidates a cached miss.
     fn resolve_without_symlinks_retrying(
         &mut self,
         source_dir: &[u8],
@@ -1841,16 +1971,79 @@ impl<'a> Resolver<'a> {
         kind: ast::ImportKind,
         global_cache: GlobalCache,
     ) -> ResultUnion {
-        Self::start_recording_touched_dirs();
-        let first = self.resolve_without_symlinks(source_dir, import_path, kind, global_cache);
-        Self::stop_recording_touched_dirs();
-        if !matches!(first, ResultUnion::NotFound) || !self.bust_touched_dirs() {
+        self.resolve_sequence_retrying(|this| {
+            this.resolve_without_symlinks(source_dir, import_path, kind, global_cache)
+        })
+    }
+
+    /// `attempt` runs one lookup, or several that fall back one to the next, and gives the
+    /// first answer that is not `NotFound`. A miss inside it is not checked. Only when
+    /// `attempt` misses as a whole is it checked on disk, once, and run again if a cached
+    /// directory was dropped.
+    fn resolve_sequence_retrying(
+        &mut self,
+        mut attempt: impl FnMut(&mut Self) -> ResultUnion,
+    ) -> ResultUnion {
+        let first = attempt(self);
+        // A replay, or a sequence of the caller's, makes its own check of the whole.
+        if !matches!(first, ResultUnion::NotFound) || replaying() || DEFERRED_MISS_CHECKS.get() != 0
+        {
+            return first;
+        }
+        if !self.recheck_after_miss(|this| {
+            let _ = attempt(this);
+        }) {
             return first;
         }
         if let Some(debug) = self.debug_logs.as_mut() {
             debug.add_note(b"Retrying after dropping stale directory cache entries".to_vec());
         }
-        self.resolve_without_symlinks(source_dir, import_path, kind, global_cache)
+        attempt(self)
+    }
+
+    /// For a caller whose own lookups fall back one to the next, the first of them being
+    /// expected to miss (an entry point is looked up as a package, then as a relative path).
+    /// `sequence` runs them with no check after a miss. Only when `sequence` fails as a whole
+    /// is it checked on disk, once, and run again if a cached directory was dropped.
+    pub fn with_deferred_miss_check<T, E>(
+        &mut self,
+        mut sequence: impl FnMut(&mut Self) -> core::result::Result<T, E>,
+    ) -> core::result::Result<T, E> {
+        let first = {
+            let _deferred = DeferredMissCheck::enter();
+            sequence(self)
+        };
+        if first.is_ok() || replaying() || DEFERRED_MISS_CHECKS.get() != 0 {
+            return first;
+        }
+        let stale = self.recheck_after_miss(|this| {
+            let _deferred = DeferredMissCheck::enter();
+            let _ = sequence(this);
+        });
+        if !stale {
+            return first;
+        }
+        let _deferred = DeferredMissCheck::enter();
+        sequence(self)
+    }
+
+    /// `lookup` just missed. Run it once more on the warm caches to collect what it reads
+    /// (the replay), check each fact on disk, and drop the cached directories that differ.
+    /// Returns whether one was dropped. A lookup that succeeds never gets here, so it
+    /// collects nothing.
+    fn recheck_after_miss(&mut self, lookup: impl FnOnce(&mut Self)) -> bool {
+        let mut touched = TouchedDirs::default();
+        {
+            let _armed = ReplayGuard::arm(&mut touched);
+            // The first run already wrote the notes and the messages of this lookup.
+            let debug_logs = self.debug_logs.take();
+            let mut scratch = bun_ast::Log::init();
+            let log = core::mem::replace(&mut self.log, NonNull::from(&mut scratch));
+            lookup(self);
+            self.log = log;
+            self.debug_logs = debug_logs;
+        }
+        self.bust_touched_dirs(&touched)
     }
 
     pub(crate) fn resolve_without_symlinks(
@@ -2597,96 +2790,108 @@ impl<'a> Resolver<'a> {
         first_bust || second_bust
     }
 
-    /// Record what the next resolution on this thread does not find.
-    fn start_recording_touched_dirs() {
-        TOUCHED_DIRS.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            let touched = slot.get_or_insert_with(Default::default);
-            touched.records.clear();
-            touched.bytes.clear();
-            touched.recording = true;
-        });
-    }
-
-    /// Keeps the records for `bust_touched_dirs`.
-    fn stop_recording_touched_dirs() {
-        TOUCHED_DIRS.with(|slot| {
-            if let Some(touched) = slot.borrow_mut().as_deref_mut() {
-                touched.recording = false;
-            }
-        });
-    }
-
     /// `dir` was looked up and did not exist.
     #[inline]
     fn record_missing_dir(&self, dir: &[u8]) {
-        record_touched(TouchedKind::MissingDir, dir, b"");
+        if replay_armed() {
+            record_touched(TouchedKind::MissingDir, dir, b"");
+        }
     }
 
     /// `dir` was a `node_modules` search level that the cache says has none.
     #[inline]
     fn record_no_node_modules(&self, dir: &[u8]) {
-        record_touched(TouchedKind::NoNodeModules, dir, b"");
+        if replay_armed() {
+            record_touched(TouchedKind::NoNodeModules, dir, b"");
+        }
     }
 
     /// `dir` was a `node_modules` search level that was searched or skipped.
     #[inline]
     fn record_search_level(&self, dir: &[u8]) {
-        record_touched(TouchedKind::SearchLevel, dir, b"");
+        if replay_armed() {
+            record_touched(TouchedKind::SearchLevel, dir, b"");
+        }
     }
 
     /// A lookup that missed depended on the `package.json` of `dir`, or on its absence.
     #[inline]
     fn record_package_json(&self, dir: &[u8]) {
-        record_touched(TouchedKind::PackageJson, dir, b"");
+        if replay_armed() {
+            record_touched(TouchedKind::PackageJson, dir, b"");
+        }
     }
 
-    /// Check each recorded negative on disk and drop the cached directories that
-    /// disagree. Returns whether anything was dropped.
-    fn bust_touched_dirs(&mut self) -> bool {
-        let Some(mut touched) = TOUCHED_DIRS.with(|slot| slot.borrow_mut().take()) else {
-            return false;
-        };
-        touched.recording = false;
-
+    /// Check on disk each fact that the replay of a miss read, and drop the cached
+    /// directories that differ. Returns whether anything was dropped.
+    fn bust_touched_dirs(&mut self, touched: &TouchedDirs) -> bool {
         let mut busted = false;
+        let mut seen: Vec<u64> = Vec::with_capacity(touched.records.len());
+        let mut is_new = |record: &TouchedDir| {
+            let key = bun_wyhash::hash_with_seed(
+                record.kind as u64 ^ bun_wyhash::hash(record.name(&touched.bytes)),
+                record.dir(&touched.bytes),
+            );
+            !seen.contains(&key) && {
+                seen.push(key);
+                true
+            }
+        };
+        // First, while every parent link that the lookup walked is still cached.
+        for record in &touched.records {
+            if record.kind == TouchedKind::TsConfig && is_new(record) {
+                busted |= self.bust_stale_tsconfig_levels(record.dir(&touched.bytes));
+            }
+        }
         // Indices of the records whose directory is rebuilt with every walked level
         // inside it: a `NoNodeModules` that has one now, a `PackageJson` that changed.
         let mut changed_levels: Vec<usize> = Vec::new();
         {
             let mut buf = bun_paths::path_buffer_pool::get();
-            let mut seen: Vec<u64> = Vec::with_capacity(touched.records.len());
             for (i, record) in touched.records.iter().enumerate() {
-                let dir = record.dir(&touched.bytes);
-                let name = record.name(&touched.bytes);
-                let key =
-                    bun_wyhash::hash_with_seed(record.kind as u64 ^ bun_wyhash::hash(name), dir);
-                if seen.contains(&key) {
+                if record.kind == TouchedKind::TsConfig || !is_new(record) {
                     continue;
                 }
-                seen.push(key);
+                let dir = record.dir(&touched.bytes);
+                let name = record.name(&touched.bytes);
                 match record.kind {
                     TouchedKind::MissingDir => {
-                        if Self::path_exists(&mut buf, &[dir]) {
+                        // A file there is still no directory.
+                        if Self::is_directory(&mut buf, &[dir]) {
                             busted |= self.bust_dir_and_stale_parents(dir);
                         }
                     }
-                    TouchedKind::MissingEntry => {
-                        if Self::path_exists(&mut buf, &[dir, name]) {
+                    TouchedKind::MissingEntry | TouchedKind::FileEntry | TouchedKind::DirEntry => {
+                        use Fs::file_system::EntryKind;
+                        let now = Self::entry_kind_now(&mut buf, &[dir, name]);
+                        let stale = match record.kind {
+                            TouchedKind::FileEntry => now != Some(EntryKind::File),
+                            TouchedKind::DirEntry => now != Some(EntryKind::Dir),
+                            _ => now.is_some(),
+                        };
+                        if stale {
                             busted |= self.bust_dir_cache(dir);
                         }
                     }
                     TouchedKind::NoNodeModules => {
-                        if Self::path_exists(&mut buf, &[dir, b"node_modules"]) {
+                        if Self::is_directory(&mut buf, &[dir, b"node_modules"])
+                            || self.parent_link_is_stale(dir)
+                        {
                             changed_levels.push(i);
                         }
                     }
-                    TouchedKind::SearchLevel => {}
+                    TouchedKind::SearchLevel => {
+                        if self.parent_link_is_stale(dir) {
+                            changed_levels.push(i);
+                        }
+                    }
                     TouchedKind::PackageJson => {
-                        if self.package_json_changed_on_disk(dir) {
+                        if self.package_json_changed_on_disk(dir) || self.parent_link_is_stale(dir)
+                        {
                             changed_levels.push(i);
                         }
                     }
+                    TouchedKind::TsConfig => {}
                 }
             }
         }
@@ -2713,20 +2918,19 @@ impl<'a> Resolver<'a> {
             touched.records.len(),
             busted
         );
-
-        touched.records.clear();
-        touched.bytes.clear();
-        TOUCHED_DIRS.with(|slot| *slot.borrow_mut() = Some(touched));
         busted
     }
 
-    /// One `access()` on the joined `parts`.
-    fn path_exists(buf: &mut bun_paths::PathBuffer, parts: &[&[u8]]) -> bool {
+    /// Joins `parts` into `buf`, with a NUL after them.
+    fn join_z<'b>(
+        buf: &'b mut bun_paths::PathBuffer,
+        parts: &[&[u8]],
+    ) -> Option<&'b bun_core::ZStr> {
         let mut len = 0usize;
         for (i, part) in parts.iter().enumerate() {
             let needs_sep = i > 0 && len > 0 && !ResolvePath::is_sep_any(buf[len - 1]);
             if len + usize::from(needs_sep) + part.len() >= buf.len() {
-                return false;
+                return None;
             }
             if needs_sep {
                 buf[len] = SEP;
@@ -2736,24 +2940,201 @@ impl<'a> Resolver<'a> {
             len += part.len();
         }
         buf[len] = 0;
-        bun_sys::exists_z(bun_core::ZStr::from_buf(&buf[..], len))
+        Some(bun_core::ZStr::from_buf(&buf[..], len))
+    }
+
+    /// One `stat()`: the joined `parts` name a directory. The test of a directory that a
+    /// lookup can enter.
+    fn is_directory(buf: &mut bun_paths::PathBuffer, parts: &[&[u8]]) -> bool {
+        Self::join_z(buf, parts)
+            .is_some_and(|path| bun_sys::directory_exists_at(FD::cwd(), path).unwrap_or(false))
+    }
+
+    /// One `stat()`: what a listing of the directory has for the joined `parts` now, through
+    /// a link too. `None`: no entry. `DirEntry::add_entry_with_store` leaves out a FIFO, a
+    /// socket and a device, and a link with no target is no entry to a lookup.
+    fn entry_kind_now(
+        buf: &mut bun_paths::PathBuffer,
+        parts: &[&[u8]],
+    ) -> Option<Fs::file_system::EntryKind> {
+        use Fs::file_system::EntryKind;
+        let path = Self::join_z(buf, parts)?;
+        match bun_sys::kind_from_mode(bun_sys::stat(path).ok()?.st_mode as bun_sys::Mode) {
+            bun_sys::FileKind::File => Some(EntryKind::File),
+            bun_sys::FileKind::Directory => Some(EntryKind::Dir),
+            _ => None,
+        }
+    }
+
+    /// The bytes of the configuration file at `path` as its loader reads them: without a
+    /// byte order mark. `O_NONBLOCK`, and only a regular file: a FIFO with that name must
+    /// not block the lookup.
+    fn read_config_file(path: &[u8]) -> bun_sys::Result<Vec<u8>> {
+        let file = bun_sys::File::openat(
+            FD::cwd(),
+            path,
+            bun_sys::O::RDONLY | bun_sys::O::NONBLOCK,
+            0,
+        )?;
+        if bun_sys::kind_from_mode(file.stat()?.st_mode as bun_sys::Mode) != bun_sys::FileKind::File
+        {
+            return Err(bun_sys::Error::from_code(
+                bun_sys::E::EISDIR,
+                bun_sys::Tag::open,
+            ));
+        }
+        let bytes = file.read_to_end()?;
+        Ok(match Fs::BOM::detect(&bytes) {
+            Some(bom) => bom.remove_and_convert_to_utf8_and_free(bytes),
+            None => bytes,
+        })
+    }
+
+    fn config_file_now(path: &[u8]) -> ConfigFileNow {
+        match Self::read_config_file(path) {
+            Ok(bytes) => ConfigFileNow::Hash(bun_wyhash::hash(&bytes)),
+            Err(err) => match err.get_errno() {
+                bun_sys::E::ENOENT | bun_sys::E::ENOTDIR | bun_sys::E::EISDIR => {
+                    ConfigFileNow::Absent
+                }
+                _ => ConfigFileNow::Unreadable,
+            },
+        }
     }
 
     /// Whether `dir`'s `package.json` no longer has the bytes the cached one was
-    /// parsed from, or exists where the cache has none. A directory that is not
-    /// cached has nothing stale to drop.
+    /// parsed from, or is one that parses where the cache has none. A directory that
+    /// is not cached has nothing stale to drop.
     fn package_json_changed_on_disk(&mut self, dir: &[u8]) -> bool {
         let Some(dir_info) = self.dir_cache_mut().get(dir) else {
             return false;
         };
         let Some(package_json) = dir_info.package_json() else {
+            if !self.opts.load_package_json {
+                return false;
+            }
             let mut buf = bun_paths::path_buffer_pool::get();
-            return Self::path_exists(&mut buf, &[dir, b"package.json"]);
+            let Some(path) = self
+                .fs_ref()
+                .abs_buf_checked(&[dir, b"package.json"], &mut buf[..])
+            else {
+                return false;
+            };
+            // One that did not parse, and still has those bytes, gives nothing again.
+            return match Self::config_file_now(path) {
+                ConfigFileNow::Hash(hash) => !is_unparsed_config(path, hash),
+                ConfigFileNow::Absent | ConfigFileNow::Unreadable => false,
+            };
         };
-        match bun_sys::File::read_from(FD::cwd(), package_json.source.path.text) {
+        match Self::read_config_file(package_json.source.path.text) {
             Ok(bytes) => bytes[..] != package_json.source_contents[..],
             Err(_) => true,
         }
+    }
+
+    /// Whether the `tsconfig.json` (or `jsconfig.json`) that `dir_info` has is not what a
+    /// read of the directory gives now: it, or a file that it extends, has other bytes, or
+    /// there is one that parses where the cache has none.
+    fn tsconfig_changed_on_disk(&mut self, dir_info: DirInfoRef) -> bool {
+        let mut buf = bun_paths::path_buffer_pool::get();
+        let dir = dir_info.abs_path;
+        let Some(tsconfig) = dir_info.tsconfig_json() else {
+            for name in [b"tsconfig.json".as_slice(), b"jsconfig.json"] {
+                let Some(path) = self.fs_ref().abs_buf_checked(&[dir, name], &mut buf[..]) else {
+                    continue;
+                };
+                match Self::config_file_now(path) {
+                    ConfigFileNow::Absent => {}
+                    // The loader takes this one, and it gives nothing.
+                    ConfigFileNow::Unreadable => return false,
+                    ConfigFileNow::Hash(hash) => return !is_unparsed_config(path, hash),
+                }
+            }
+            return false;
+        };
+        // `jsconfig.json` is read only where there is no `tsconfig.json`.
+        if tsconfig
+            .sources
+            .first()
+            .is_some_and(|own| bun_paths::basename(&own.path) == b"jsconfig.json")
+        {
+            if let Some(path) = self
+                .fs_ref()
+                .abs_buf_checked(&[dir, b"tsconfig.json"], &mut buf[..])
+            {
+                if !matches!(Self::config_file_now(path), ConfigFileNow::Absent) {
+                    return true;
+                }
+            }
+        }
+        tsconfig
+            .sources
+            .iter()
+            .any(|source| Self::config_file_now(&source.path).hash() != source.hash)
+    }
+
+    /// A lookup in the cached directory `reader` read the `tsconfig.json` of the nearest
+    /// level that has one. `dir_info_uncached` read that file with its directory, so the
+    /// lookup has no other record of it. Drop the cached levels from `reader` up to the
+    /// first one whose `tsconfig.json` changed: each level below it inherits it.
+    fn bust_stale_tsconfig_levels(&mut self, reader: &[u8]) -> bool {
+        if !self.opts.load_tsconfig_json || self.opts.tsconfig_override.is_some() {
+            return false;
+        }
+        let Some(start) = self.dir_cache_mut().get(reader).map(DirInfoRef::from_slot) else {
+            return false;
+        };
+        let mut stale = None;
+        let mut level = Some(start);
+        while let Some(dir_info) = level {
+            if self.tsconfig_changed_on_disk(dir_info) {
+                stale = Some(dir_info.abs_path);
+                break;
+            }
+            if dir_info.tsconfig_json().is_some() {
+                break;
+            }
+            // What this level inherits came through a slot that was dropped since.
+            if self.parent_link_is_stale(strings::without_trailing_slash_windows_path(
+                dir_info.abs_path,
+            )) {
+                stale = Some(dir_info.abs_path);
+                break;
+            }
+            level = dir_info.get_parent();
+        }
+        let Some(stale) = stale else {
+            return false;
+        };
+        let mut busted = false;
+        let mut level = Some(start);
+        while let Some(dir_info) = level {
+            level = dir_info.get_parent();
+            let dir = dir_info.abs_path;
+            busted |= self.bust_dir_cache(dir);
+            if dir == stale {
+                break;
+            }
+        }
+        busted
+    }
+
+    /// Whether the cached `dir` reaches its parent through a slot that is no longer the
+    /// cached one for that path. `bust_dir_cache` of the parent (a watcher does it) leaves the
+    /// old slot in place, and a walk up from `dir` still reads that slot: its `package.json`,
+    /// its `tsconfig.json`, its `node_modules` bit.
+    fn parent_link_is_stale(&mut self, dir: &[u8]) -> bool {
+        let Some(parent) = self
+            .dir_cache_mut()
+            .get(dir)
+            .and_then(|dir_info| dir_info.get_parent())
+        else {
+            return false;
+        };
+        let parent_dir = strings::without_trailing_slash_windows_path(parent.abs_path);
+        !self.dir_cache_mut().get(parent_dir).is_some_and(|current| {
+            core::ptr::eq::<DirInfo::DirInfo>(&raw const *current, &raw const *parent)
+        })
     }
 
     /// Both are cache keys: absolute, no trailing separator unless a root.
@@ -2766,6 +3147,7 @@ impl<'a> Resolver<'a> {
 
     /// Drop `dir`, then each ancestor whose cached listing does not know the child
     /// below it: that listing is where the entry and a symlink's target are read from.
+    /// A link that was dangling when it was read is not known either.
     fn bust_dir_and_stale_parents(&mut self, dir: &[u8]) -> bool {
         let mut busted = self.bust_dir_cache(dir);
         let mut child = dir;
@@ -2775,12 +3157,13 @@ impl<'a> Resolver<'a> {
                 break;
             }
             let base = bun_paths::basename(child);
-            let listed = self
-                .fs_mut()
-                .fs
-                .entries
-                .get(parent)
-                .is_some_and(|entries| entries.lookup(base).0.is_some());
+            let listed = self.fs_mut().fs.entries.get(parent).is_some_and(|entries| {
+                entries.lookup(base).0.is_some_and(|query| {
+                    let entry = query.entry();
+                    entry.need_stat.load(core::sync::atomic::Ordering::Acquire)
+                        || entry.cache().kind != Fs::file_system::EntryKind::Dangling
+                })
+            });
             if listed {
                 break;
             }
@@ -2852,26 +3235,21 @@ impl<'a> Resolver<'a> {
         let mut is_self_reference = false;
 
         // Find the parent directory with the "package.json" file
-        let is_subpath_import = import_path.starts_with(b"#") && !forbid_imports;
         let mut dir_info_package_json: Option<DirInfoRef> = Some(dir_info);
         while let Some(d) = dir_info_package_json {
             if d.package_json.is_some() {
                 break;
             }
-            if is_subpath_import {
-                self.record_package_json(d.abs_path);
-            } else {
-                self.record_search_level(d.abs_path);
-            }
+            // A package.json that appears here takes the place of the one above.
+            self.record_package_json(d.abs_path);
             dir_info_package_json = d.get_parent();
         }
 
         // Check for subpath imports: https://nodejs.org/api/packages.html#subpath-imports
         if let Some(_dir_info_package_json) = dir_info_package_json {
             let package_json = _dir_info_package_json.package_json().unwrap();
-            if is_subpath_import {
-                self.record_package_json(_dir_info_package_json.abs_path);
-            }
+            // Its "imports" map, and its name and "exports": a package can import itself.
+            self.record_package_json(_dir_info_package_json.abs_path);
 
             if import_path.starts_with(b"#") && !forbid_imports && package_json.imports.is_some() {
                 let r = self.load_package_imports(
@@ -3185,7 +3563,9 @@ impl<'a> Resolver<'a> {
         dir_info = source_dir_info;
 
         // this is the magic!
-        if global_cache.can_use(any_node_modules_folder)
+        // Not from a replay: the first run already asked the package manager.
+        if !replaying()
+            && global_cache.can_use(any_node_modules_folder)
             && self.use_package_manager()
             && let Some(esm_ref) = esm_.as_ref()
             && strings::is_npm_package_name(esm_ref.name)
@@ -4331,10 +4711,12 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// `source_hash` gets a hash of the bytes that were read, also when they do not parse.
     pub(crate) fn parse_tsconfig(
         &mut self,
         file: &[u8],
         dirname_fd: FD,
+        source_hash: &mut Option<u64>,
     ) -> crate::CrateResult<Option<Box<TSConfigJSON>>> {
         // Since tsconfig.json is cached permanently, in our DirEntries cache
         // we must use the global allocator
@@ -4373,6 +4755,7 @@ impl<'a> Resolver<'a> {
             crate::cache::Contents::Empty => Vec::new(),
             other => other.as_slice().to_vec(),
         };
+        *source_hash = Some(bun_wyhash::hash(&contents));
 
         let source = bun_ast::Source::init_path_string_owned(key_path, contents);
         let file_dir = source.path.source_dir();
@@ -4548,6 +4931,18 @@ impl<'a> Resolver<'a> {
 
         let path_without_trailing_slash = strings::without_trailing_slash_windows_path(input_path);
         Self::assert_valid_cache_key(path_without_trailing_slash);
+        if replaying() {
+            // A replay builds nothing. What the first run left out of the cache is recorded
+            // as missing, and the check on disk decides.
+            let cached = self
+                .dir_cache_mut()
+                .get(path_without_trailing_slash)
+                .map(DirInfoRef::from_slot);
+            if cached.is_none() {
+                record_touched(TouchedKind::MissingDir, path_without_trailing_slash, b"");
+            }
+            return Ok(cached);
+        }
         let top_result = self
             .dir_cache_mut()
             .get_or_put(path_without_trailing_slash)?;
@@ -5971,12 +6366,9 @@ impl<'a> Resolver<'a> {
         let mut package_json: Option<*const PackageJSON> = None;
 
         // Try using the main field(s) from "package.json"
-        if dir_info.package_json().is_none() {
-            // Absent, or unparseable; `DirEntry::get` saw that lookup when the
-            // directory was read, not now. An unparseable file passes the
-            // `access()` re-check, so a miss through it re-reads the directory.
-            record_missing_entry(dir_info.abs_path, b"package.json");
-        }
+        // Its "main" fields, or that it has none, or does not parse. `DirEntry::get` saw the
+        // lookup of the file when the directory was read, not now.
+        self.record_package_json(dir_info.abs_path);
         if let Some(pkg_json) = dir_info.package_json() {
             package_json = Some(std::ptr::from_ref(pkg_json));
             if pkg_json.main_fields.count() > 0 {
@@ -6377,7 +6769,7 @@ impl<'a> Resolver<'a> {
         if FeatureFlags::WATCH_DIRECTORIES {
             // For existent directories which don't find a match
             // Start watching it automatically,
-            if let Some(watcher) = self.watcher.as_ref() {
+            if let Some(watcher) = self.watcher.as_ref().filter(|_| !replaying()) {
                 if let Some((dir, fd)) = dir_entry.get().dir_and_fd() {
                     watcher.watch(dir, fd);
                 }
@@ -6851,34 +7243,42 @@ impl<'a> Resolver<'a> {
         tsconfigpath: &[u8],
         fd: FD,
     ) -> crate::CrateResult<Option<Box<TSConfigJSON>>> {
-        let parsed_tsconfig: Option<*mut TSConfigJSON> = match self.parse_tsconfig(tsconfigpath, fd)
-        {
-            Ok(v) => v.map(bun_core::heap::into_raw),
-            Err(err) => {
-                let pretty = tsconfigpath;
-                if err == crate::Error::Sys(bun_errno::SystemErrno::ENOENT) {
-                    let _ = self.log_mut().add_error_fmt(
-                        None,
-                        bun_ast::Loc::EMPTY,
-                        format_args!("Cannot find tsconfig file {}", bun_core::fmt::quote(pretty)),
-                    );
-                } else if err != crate::Error::ParseErrorAlreadyLogged
-                    && err != crate::Error::Sys(bun_errno::SystemErrno::EISDIR)
-                {
-                    let _ = self.log_mut().add_error_fmt(
-                        None,
-                        bun_ast::Loc::EMPTY,
-                        format_args!(
-                            "Cannot read file {}: {}",
-                            bun_core::fmt::quote(pretty),
-                            bstr::BStr::new(err.name())
-                        ),
-                    );
+        let mut source_hash = None;
+        let parsed_tsconfig: Option<*mut TSConfigJSON> =
+            match self.parse_tsconfig(tsconfigpath, fd, &mut source_hash) {
+                Ok(v) => v.map(bun_core::heap::into_raw),
+                Err(err) => {
+                    let pretty = tsconfigpath;
+                    if err == crate::Error::Sys(bun_errno::SystemErrno::ENOENT) {
+                        let _ = self.log_mut().add_error_fmt(
+                            None,
+                            bun_ast::Loc::EMPTY,
+                            format_args!(
+                                "Cannot find tsconfig file {}",
+                                bun_core::fmt::quote(pretty)
+                            ),
+                        );
+                    } else if err != crate::Error::ParseErrorAlreadyLogged
+                        && err != crate::Error::Sys(bun_errno::SystemErrno::EISDIR)
+                    {
+                        let _ = self.log_mut().add_error_fmt(
+                            None,
+                            bun_ast::Loc::EMPTY,
+                            format_args!(
+                                "Cannot read file {}: {}",
+                                bun_core::fmt::quote(pretty),
+                                bstr::BStr::new(err.name())
+                            ),
+                        );
+                    }
+                    None
                 }
-                None
-            }
-        };
+            };
         if let Some(tsconfig_json) = parsed_tsconfig {
+            let mut sources = vec![ConfigSource {
+                path: Box::from(tsconfigpath),
+                hash: source_hash,
+            }];
             let mut parent_configs: BoundedArray<*mut TSConfigJSON, 64> = BoundedArray::default();
             parent_configs.append(tsconfig_json)?;
             // `current`/`parent_config_ptr`/`merged_config` are heap TSConfigJSON
@@ -6891,15 +7291,22 @@ impl<'a> Resolver<'a> {
             while !current.extends.is_empty() {
                 let ts_dir_name = Dirname::dirname(&current.abs_path);
                 // `extends` comes from the config file and can be any length.
+                let mut source_hash = None;
                 let parsed = match ResolvePath::join_abs_string_buf_checked(
                     ts_dir_name,
                     bufs!(tsconfig_path_abs),
                     &[ts_dir_name, &current.extends],
                     bun_paths::Platform::AUTO,
                 ) {
-                    Some(abs_path) => self
-                        .parse_tsconfig(abs_path, FD::INVALID)
-                        .map_err(|err| (err, abs_path)),
+                    Some(abs_path) => {
+                        let parsed = self.parse_tsconfig(abs_path, FD::INVALID, &mut source_hash);
+                        // The one that gives nothing too: the chain is longer once it parses.
+                        sources.push(ConfigSource {
+                            path: Box::from(abs_path),
+                            hash: source_hash,
+                        });
+                        parsed.map_err(|err| (err, abs_path))
+                    }
                     None => Err((
                         crate::Error::Sys(bun_errno::SystemErrno::ENAMETOOLONG),
                         &current.extends[..],
@@ -6983,7 +7390,12 @@ impl<'a> Resolver<'a> {
             }
             // SAFETY: from `parse_tsconfig` (heap::into_raw) above; the walk is over, so this
             // is the only pointer to it.
-            return Ok(Some(unsafe { bun_core::heap::take(merged_config) }));
+            let mut merged = unsafe { bun_core::heap::take(merged_config) };
+            merged.sources = sources;
+            return Ok(Some(merged));
+        }
+        if let Some(hash) = source_hash {
+            note_unparsed_config(tsconfigpath, hash);
         }
         Ok(None)
     }
@@ -7025,9 +7437,14 @@ impl<'a> Resolver<'a> {
     ) -> Option<TSConfigRef> {
         match self.tsconfig_override() {
             Some(it) => it.map(TSConfigRef::Override),
-            None => dir_info
-                .enclosing_tsconfig_json
-                .map(TSConfigRef::OfDirectory),
+            None => {
+                if replay_armed() {
+                    record_touched(TouchedKind::TsConfig, dir_info.abs_path, b"");
+                }
+                dir_info
+                    .enclosing_tsconfig_json
+                    .map(TSConfigRef::OfDirectory)
+            }
         }
     }
 

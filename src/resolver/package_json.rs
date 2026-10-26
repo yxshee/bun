@@ -490,9 +490,19 @@ impl PackageJSON {
         let contents_static: &'static [u8] = unsafe { bun_ptr::detach_lifetime(&entry_contents) };
         let json_source = bun_ast::Source::init_path_string(package_json_path, contents_static);
 
+        // A lookup that misses reads the file again, and must tell whether it changed.
+        let note_unparsed = || {
+            crate::resolver::note_unparsed_config(
+                package_json_path,
+                bun_wyhash::hash(contents_static),
+            );
+        };
         let parsed_json = match r.caches.json.parse_package_json(r_log, &json_source) {
             Ok(Some(v)) => v,
-            Ok(None) => return None,
+            Ok(None) => {
+                note_unparsed();
+                return None;
+            }
             Err(err) => {
                 if cfg!(debug_assertions) {
                     Output::print_error(format_args!(
@@ -501,6 +511,7 @@ impl PackageJSON {
                         bstr::BStr::new(err.name())
                     ));
                 }
+                note_unparsed();
                 return None;
             }
         };
@@ -510,6 +521,7 @@ impl PackageJSON {
             // Invalid package.json in node_modules is noisy.
             // Let's just ignore it.
             // (allocator.free dropped — entry.contents owned by `entry`)
+            note_unparsed();
             return None;
         }
 

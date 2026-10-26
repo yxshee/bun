@@ -252,7 +252,11 @@ impl Entry {
                 self.need_stat.store(false, Ordering::Release);
             }
         }
-        self.cache().kind
+        let kind = self.cache().kind;
+        if crate::resolver::replay_armed() {
+            crate::resolver::record_entry_kind(self.dir, self.base(), kind);
+        }
+        kind
     }
 
     ///
