@@ -11,6 +11,7 @@
 use core::mem::offset_of;
 use std::io::Write as _;
 
+use bun_bundler::transpiler::EntryPointError;
 use bun_collections::{ArrayHashMap, StringArrayHashMap, bit_set::DynamicBitSetUnmanaged};
 use bun_core::strings;
 
@@ -277,6 +278,43 @@ pub(crate) struct TakeJSBundleOptionsServer {
 struct TempLookup {
     edge_index: EdgeIndex,
     seen: bool,
+}
+
+/// The state of one `on_file_deleted` walk. It allocates nothing while every importer resolves.
+#[derive(Default)]
+struct DeletedFileWalk<const SIDE: bake::Side> {
+    /// The importers that did not resolve, in the order the walk handles them, each with the
+    /// answer of the resolver.
+    unresolved: Vec<(FileIndex<SIDE>, EntryPointError)>,
+    /// Parallel to `bundled_files`: set for every file in `unresolved`.
+    seen: DynamicBitSetUnmanaged,
+    /// The directories whose listing this walk dropped from the resolver.
+    dropped_dirs: StringArrayHashMap<()>,
+}
+
+impl<const SIDE: bake::Side> DeletedFileWalk<SIDE> {
+    /// True when this walk did not drop the listing of `dir` before. The caller drops it.
+    fn first_drop_of(&mut self, dir: &[u8]) -> Result<bool, bun_alloc::AllocError> {
+        Ok(!self.dropped_dirs.get_or_put(dir)?.found_existing)
+    }
+
+    fn has(&self, file: FileIndex<SIDE>) -> bool {
+        self.seen.bit_length != 0 && self.seen.is_set(file.get() as usize)
+    }
+
+    fn add(
+        &mut self,
+        file: FileIndex<SIDE>,
+        err: EntryPointError,
+        file_count: usize,
+    ) -> Result<(), bun_alloc::AllocError> {
+        if self.seen.bit_length == 0 {
+            self.seen = DynamicBitSetUnmanaged::init_empty(file_count)?;
+        }
+        self.seen.set(file.get() as usize);
+        self.unresolved.push((file, err));
+        Ok(())
+    }
 }
 
 /// Parameterized via `adt_const_params` on `bake::Side`; `File` itself is
@@ -1611,65 +1649,127 @@ impl<const SIDE: bake::Side> IncrementalGraph<SIDE> {
     // onFileDeleted / invalidate
     // ────────────────────────────────────────────────────────────────────────
 
-    /// `IncrementalGraph(side).onFileDeleted` (spec :1528).
+    /// `IncrementalGraph(side).onFileDeleted` (spec :1528). Builds every importer of the file
+    /// again, so that the importer reports its failed import. An importer that does not resolve
+    /// is handled like the file. Returns those importers, each with the answer of the resolver.
+    /// `graph` is the graph that the failed parse task or entry point was for. The bundle gets
+    /// every file that is handled here: it fails the imports that it already resolved to one.
     pub(crate) fn on_file_deleted(
         &mut self,
         abs_path: &[u8],
+        graph: bake::Graph,
         bv2: &mut bun_bundler::BundleV2<'_>,
-    ) -> Result<(), bun_alloc::AllocError> {
-        let Some(index) = self.get_file_index(abs_path) else {
-            return Ok(());
+    ) -> Result<Vec<(FileIndex<SIDE>, EntryPointError)>, bun_alloc::AllocError> {
+        bv2.file_deleted_in_dev_server(abs_path, Some(graph));
+        let Some(root) = self.get_file_index(abs_path) else {
+            return Ok(Vec::new());
         };
 
-        // Disconnect all imports.
-        let mut it = self.edge_lists[index.get() as usize].first_import.take();
-        while let Some(edge_index) = it {
-            let dep = self.edges[edge_index.get() as usize];
-            it = dep.next_import;
-            debug_assert_eq!(dep.dependency.get(), index.get());
-            self.disconnect_edge_from_dependency_list(edge_index);
-            self.free_edge(edge_index);
-        }
+        let mut walk = DeletedFileWalk::<SIDE>::default();
+        let mut index = root;
+        let mut walked = 0;
+        // A loop and not a recursion: a step frees edges of the dependency lists of other files.
+        loop {
+            // Disconnect all imports.
+            let mut it = self.edge_lists[index.get() as usize].first_import.take();
+            while let Some(edge_index) = it {
+                let dep = self.edges[edge_index.get() as usize];
+                it = dep.next_import;
+                debug_assert_eq!(dep.dependency.get(), index.get());
+                self.disconnect_edge_from_dependency_list(edge_index);
+                self.free_edge(edge_index);
+            }
+            // The cached code has no imports now. A build that finds the file again parses it.
+            self.ensure_stale_bit_capacity(true)?;
+            self.stale_files.set(index.get() as usize);
 
-        // Rebuild all dependencies.
-        let mut it = self.edge_lists[index.get() as usize].first_dep;
-        while let Some(edge_index) = it {
-            let dep = self.edges[edge_index.get() as usize];
-            it = dep.next_dependency;
-            debug_assert_eq!(dep.imported.get(), index.get());
-            let key = &self.bundled_files.keys()[dep.dependency.get() as usize];
-            let file = &self.bundled_files.values()[dep.dependency.get() as usize];
-            let loader = file
-                .html_route_bundle_index
-                .is_some()
-                .then_some(bun_ast::Loader::Html);
-            let mut enqueue = |target| {
+            // Rebuild all dependencies.
+            let mut it = self.edge_lists[index.get() as usize].first_dep;
+            while let Some(edge_index) = it {
+                let dep = self.edges[edge_index.get() as usize];
+                it = dep.next_dependency;
+                debug_assert_eq!(dep.imported.get(), index.get());
+                self.rebuild_importer_of_deleted_file(dep.dependency, bv2, &mut walk)?;
+            }
+
+            if index == root {
+                // Bust the resolution cache of the dir containing this file.
+                let dirname = bun_paths::dirname(abs_path).unwrap_or(abs_path);
+                if walk.dropped_dirs.is_empty() || walk.first_drop_of(dirname)? {
+                    let _ = bv2.transpiler.resolver.bust_dir_cache(dirname);
+                }
+
+                // Clear the cached entry from the path→source-index maps.
+                for map in bv2.graph.build_graphs.values_mut() {
+                    map.remove(abs_path);
+                }
+            }
+
+            let Some(&(unresolved, _)) = walk.unresolved.get(walked) else {
+                break;
+            };
+            walked += 1;
+            index = unresolved;
+        }
+        Ok(walk.unresolved)
+    }
+
+    /// Queues one importer of a deleted file, for each graph that bundles it. `walk` takes an
+    /// importer that does not resolve.
+    fn rebuild_importer_of_deleted_file(
+        &self,
+        importer: FileIndex<SIDE>,
+        bv2: &mut bun_bundler::BundleV2<'_>,
+        walk: &mut DeletedFileWalk<SIDE>,
+    ) -> Result<(), bun_alloc::AllocError> {
+        use bun_bundler::bundle_v2::InvalidationOutcome;
+
+        // A file that imports two deleted files comes here two times.
+        if walk.has(importer) {
+            return Ok(());
+        }
+        let key: &[u8] = &self.bundled_files.keys()[importer.get() as usize];
+        let file = &self.bundled_files.values()[importer.get() as usize];
+        let loader = file
+            .html_route_bundle_index
+            .is_some()
+            .then_some(bun_ast::Loader::Html);
+        let targets = match SIDE {
+            Side::Client => [Some(bun_ast::Target::Browser), None],
+            Side::Server => [
+                file.is_rsc.then_some(bun_ast::Target::Bun),
+                file.rebundles_for_ssr_graph()
+                    .then_some(bun_ast::Target::ServerComponentsSsr),
+            ],
+        };
+        for target in targets.into_iter().flatten() {
+            let enqueue = |bv2: &mut bun_bundler::BundleV2<'_>| {
                 bun_core::handle_oom(
                     bv2.enqueue_file_from_dev_server_incremental_graph_invalidation(
                         key, target, loader,
                     ),
                 )
             };
-            match SIDE {
-                Side::Client => enqueue(bun_ast::Target::Browser),
-                Side::Server => {
-                    if file.is_rsc {
-                        enqueue(bun_ast::Target::Bun);
-                    }
-                    if file.rebundles_for_ssr_graph() {
-                        enqueue(bun_ast::Target::ServerComponentsSsr);
-                    }
+            let mut outcome = enqueue(bv2);
+            if matches!(outcome, InvalidationOutcome::Unresolved(_)) {
+                // A listing that is older than the file does not have it. Read each directory
+                // again one time in a walk: every drop leaves the old listing allocated.
+                let dirname = bun_paths::dirname(key).unwrap_or(key);
+                if walk.first_drop_of(dirname)? && bv2.transpiler.resolver.bust_dir_cache(dirname) {
+                    outcome = enqueue(bv2);
                 }
             }
-        }
-
-        // Bust the resolution cache of the dir containing this file.
-        let dirname = bun_paths::dirname(abs_path).unwrap_or(abs_path);
-        let _ = bv2.transpiler.resolver.bust_dir_cache(dirname);
-
-        // Clear the cached entry from the path→source-index maps.
-        for map in bv2.graph.build_graphs.values_mut() {
-            map.remove(abs_path);
+            match outcome {
+                InvalidationOutcome::Queued
+                | InvalidationOutcome::AlreadyInBundle
+                | InvalidationOutcome::NotAFilePath => {}
+                InvalidationOutcome::Unresolved(err) => {
+                    bv2.file_deleted_in_dev_server(key, None);
+                    walk.add(importer, err, self.bundled_files.count())?;
+                    // The other graph has the same file.
+                    break;
+                }
+            }
         }
         Ok(())
     }

@@ -372,6 +372,17 @@ impl<'a> Transpiler<'a> {
         first
     }
 
+    /// `resolve_entry_point` with one lookup, no retry, and no message in the log.
+    pub fn resolve_entry_point_quiet(
+        &mut self,
+        entry_point: &[u8],
+    ) -> Result<resolver::Result, EntryPointError> {
+        let resolved = self
+            ._resolve_entry_point(entry_point)
+            .map_err(EntryPointError::Resolve)?;
+        Self::bundleable_entry_point(resolved)
+    }
+
     /// Resolve an entry-point specifier, busting the directory cache and
     /// retrying once on failure before reporting the error to the log.
     pub fn resolve_entry_point(&mut self, entry_point: &[u8]) -> crate::Result<resolver::Result> {
@@ -438,56 +449,40 @@ impl<'a> Transpiler<'a> {
                     // ignore this error, we will print the original error
                 }
 
-                self.log_mut().add_error_fmt(
-                    None,
-                    bun_ast::Loc::EMPTY,
-                    format_args!(
-                        "{} resolving \"{}\" (entry point)",
-                        err,
-                        bstr::BStr::new(entry_point)
-                    ),
-                );
+                EntryPointError::Resolve(err).add_to_log(self.log_mut(), entry_point);
                 Err(err)
             }
         }
     }
 
-    /// A disabled module imports as `{}` and an external one stays an import. An entry point has
-    /// nothing to emit in either case. `--external` skips entry points, so external means builtin.
     fn reject_unbundleable_entry_point(
         &self,
         resolved: resolver::Result,
         entry_point: &[u8],
     ) -> crate::Result<resolver::Result> {
-        let is_builtin = if resolved.flags.is_external() {
-            true
-        } else if resolved.path_const().is_some() {
-            return Ok(resolved);
-        } else {
-            // Stubbed builtins carry the "node" namespace; anything else came from a "browser" map.
-            resolved.path_pair.primary.namespace == b"node"
-        };
+        Self::bundleable_entry_point(resolved).map_err(|err| {
+            err.add_to_log(self.log_mut(), entry_point);
+            err.into()
+        })
+    }
 
-        if is_builtin {
-            self.log_mut().add_error_fmt(
-                None,
-                bun_ast::Loc::EMPTY,
-                format_args!(
-                    "Cannot use \"{}\" as an entry point: it resolves to a builtin module",
-                    bstr::BStr::new(entry_point)
-                ),
-            );
-        } else {
-            self.log_mut().add_error_fmt(
-                None,
-                bun_ast::Loc::EMPTY,
-                format_args!(
-                    "\"{}\" is disabled due to \"browser\" field in package.json (entry point)",
-                    bstr::BStr::new(entry_point)
-                ),
-            );
+    /// A disabled module imports as `{}` and an external one stays an import. An entry point has
+    /// nothing to emit in either case. `--external` skips entry points, so external means builtin.
+    fn bundleable_entry_point(
+        resolved: resolver::Result,
+    ) -> Result<resolver::Result, EntryPointError> {
+        if resolved.flags.is_external() {
+            return Err(EntryPointError::Builtin);
         }
-        Err(crate::Error::ResolveMessage)
+        if resolved.path_const().is_some() {
+            return Ok(resolved);
+        }
+        // Stubbed builtins carry the "node" namespace; anything else came from a "browser" map.
+        Err(if resolved.path_pair.primary.namespace == b"node" {
+            EntryPointError::Builtin
+        } else {
+            EntryPointError::Disabled
+        })
     }
 
     /// Load env files and build `options.define`. Idempotent — a no-op once
@@ -569,6 +564,56 @@ impl<'a> Transpiler<'a> {
     /// `self.options` so the resolver sees the same conditions/target/public_path.
     pub fn sync_resolver_opts(&mut self) {
         self.resolver.opts = resolver_bundle_options_subset(&self.options);
+    }
+}
+
+/// Why an entry point has no module to bundle.
+#[derive(Debug, Clone, Copy)]
+pub enum EntryPointError {
+    /// The resolver did not find it.
+    Resolve(crate::Error),
+    /// It resolves to a builtin module.
+    Builtin,
+    /// A "browser" field in package.json disables it.
+    Disabled,
+}
+
+impl EntryPointError {
+    /// Adds the message that `Transpiler::resolve_entry_point` reports for this error.
+    pub fn add_to_log(self, log: &mut bun_ast::Log, entry_point: &[u8]) {
+        let entry_point = bstr::BStr::new(entry_point);
+        match self {
+            Self::Resolve(err) => log.add_error_fmt(
+                None,
+                bun_ast::Loc::EMPTY,
+                format_args!("{} resolving \"{}\" (entry point)", err, entry_point),
+            ),
+            Self::Builtin => log.add_error_fmt(
+                None,
+                bun_ast::Loc::EMPTY,
+                format_args!(
+                    "Cannot use \"{}\" as an entry point: it resolves to a builtin module",
+                    entry_point
+                ),
+            ),
+            Self::Disabled => log.add_error_fmt(
+                None,
+                bun_ast::Loc::EMPTY,
+                format_args!(
+                    "\"{}\" is disabled due to \"browser\" field in package.json (entry point)",
+                    entry_point
+                ),
+            ),
+        }
+    }
+}
+
+impl From<EntryPointError> for crate::Error {
+    fn from(err: EntryPointError) -> Self {
+        match err {
+            EntryPointError::Resolve(err) => err,
+            EntryPointError::Builtin | EntryPointError::Disabled => crate::Error::ResolveMessage,
+        }
     }
 }
 

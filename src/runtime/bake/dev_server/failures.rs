@@ -329,28 +329,29 @@ impl DevServer {
             log.msgs.len(),
         );
 
-        let mut watch_for_route_file = false;
+        let mut route_files_to_watch: Vec<Box<[u8]>> = Vec::new();
         if matches!(err.name(), "ENOENT" | "FileNotFound" | "ModuleNotFound") {
             // Special-case files being deleted: the importers report them.
             match graph {
                 bake::Graph::Server | bake::Graph::Ssr => {
-                    self.server_graph.on_file_deleted(abs_path, bv2)?
+                    self.server_graph.on_file_deleted(abs_path, graph, bv2)?;
                 }
                 bake::Graph::Client => {
-                    self.client_graph.on_file_deleted(abs_path, bv2)?;
-                    // The html file of a route has no importer.
-                    if let Some(file) = self
-                        .client_graph
-                        .bundled_files
-                        .get(abs_path)
-                        .filter(|file| file.html_route_bundle_index.is_some())
-                    {
-                        // `failed` is cleared by the next successful bundle.
-                        watch_for_route_file = !file.failed;
-                        self.client_graph.insert_failure(
-                            incremental_graph::InsertFailureKey::AbsPath(abs_path, graph),
-                            log,
-                        )?;
+                    let unresolved_importers =
+                        self.client_graph.on_file_deleted(abs_path, graph, bv2)?;
+                    if let Some(index) = self.client_graph.get_file_index(abs_path) {
+                        self.fail_if_route_file(index, log, &mut route_files_to_watch)?;
+                    }
+                    for (index, err) in unresolved_importers {
+                        if self.client_graph.html_route_bundle_index(index).is_none() {
+                            continue;
+                        }
+                        let mut unresolved = Log::init();
+                        err.add_to_log(
+                            &mut unresolved,
+                            &self.client_graph.bundled_files.keys()[index.get() as usize],
+                        );
+                        self.fail_if_route_file(index, &unresolved, &mut route_files_to_watch)?;
                     }
                 }
             }
@@ -366,16 +367,36 @@ impl DevServer {
         // `track_resolution_failure` takes the graph lock itself.
         drop(graph_lock);
 
-        if watch_for_route_file {
+        for route_file in &route_files_to_watch {
             // Bundles the route again once its html file exists, like a failed import.
             self.directory_watchers.track_resolution_failure(
-                abs_path,
-                paths::basename(abs_path),
+                route_file,
+                paths::basename(route_file),
                 bake::Graph::Client,
                 Loader::Html,
             )?;
         }
         Ok(())
+    }
+
+    /// The html file of a route has no importer to report that it is gone, so the file itself
+    /// fails. `to_watch` gets the file if the route needs a directory watch for it.
+    fn fail_if_route_file(
+        &mut self,
+        index: incremental_graph::ClientFileIndex,
+        log: &Log,
+        to_watch: &mut Vec<Box<[u8]>>,
+    ) -> Result<(), AllocError> {
+        let file = self.client_graph.get_file_by_index(index);
+        if file.html_route_bundle_index.is_none() {
+            return Ok(());
+        }
+        // `failed` is cleared by the next successful bundle.
+        if !file.failed {
+            to_watch.push(self.client_graph.bundled_files.keys()[index.get() as usize].clone());
+        }
+        self.client_graph
+            .insert_failure(incremental_graph::InsertFailureKey::Index(index.get()), log)
     }
 
     /// Return a log to write resolution failures into.
